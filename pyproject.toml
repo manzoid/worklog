@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worklog"
+version = "0.1.0"
+description = "Unified work session report from zsh history + Claude Code history"
+requires-python = ">=3.10"
+
+[project.scripts]
+worklog = "worklog.cli:main"
