@@ -1,6 +1,6 @@
 # worklog
 
-CLI that combines your **zsh history** and **Claude Code history** into a unified work session report. Shows when you were actually working, even when most of your activity happened inside Claude sessions (which don't appear in shell history).
+CLI that combines your **zsh history**, **Claude Code history**, **Codex history**, and **calendar meetings** into a unified work session report. Shows when you were actually working, even when most of your activity happened inside agent sessions (which don't appear in shell history) or in meetings (which don't generate any local activity at all).
 
 ## Setup
 
@@ -40,7 +40,43 @@ fc -li -1
 
 Claude Code automatically writes `~/.claude/history.jsonl` with millisecond timestamps for every prompt you send. No setup needed — if you use Claude Code, you already have this file.
 
-### 3. Install worklog
+### 3. Codex history
+
+Codex automatically writes per-session rollout files under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`. worklog extracts every `event_msg` with `payload.type == "user_message"` — the analog of Claude's per-prompt history. No setup needed.
+
+### 4. Calendar meetings (optional)
+
+worklog reads meetings from a local JSON cache at `~/.worklog/calendar.json`. It does NOT talk to any calendar service itself — that keeps worklog decoupled from Google Calendar, Outlook, iCloud, .ics files, or whatever else you use, and avoids the auth complexity of giving a CLI access to your calendar. Populate the cache however you want; worklog treats whatever is in the file as activity windows to fold into sessions.
+
+Cache format:
+
+```json
+{
+  "events": [
+    {"start": "2026-04-08T13:30:00+09:00", "end": "2026-04-08T13:45:00+09:00", "summary": "Daily standup"}
+  ]
+}
+```
+
+Required fields: `start`, `end` (ISO 8601, with or without timezone). `summary` is optional. Any provider- or workflow-specific filtering (only billable meetings, only events you actually attended, only meetings tagged a certain way) happens at write time — write only what you want counted.
+
+Each event becomes a continuous session whose bounds match the meeting's real start/end.
+
+#### Refreshing the cache (for agents)
+
+If you're using an LLM agent with calendar access (e.g. Claude Code with a Google Calendar MCP, an Outlook plugin, an .ics fetcher, etc.), give it instructions like:
+
+> Fetch events from `<source>` for `<time range>`, apply this filter: `<your filter — e.g. "only events I marked billable", "only events I accepted", "only events tagged client-X">`, then overwrite `~/.worklog/calendar.json` with:
+>
+> ```json
+> {"events": [{"start": "<ISO 8601>", "end": "<ISO 8601>", "summary": "<title>"}]}
+> ```
+>
+> One object per kept event. `start` and `end` are required; `summary` is optional. Overwrite the file fully — worklog reads it as-is, no merging.
+
+Worklog itself does not filter, so the agent must apply your filter at write time. Be explicit about the filter: provider-specific quirks (Google Calendar `colorId`, Outlook categories, .ics `X-` properties) live in the agent's instructions, not in worklog.
+
+### 5. Install worklog
 
 ```bash
 cd /path/to/worklog
@@ -74,19 +110,25 @@ worklog --gap 60    # 1-hour gaps
 # Show only one source
 worklog --source zsh
 worklog --source claude
+worklog --source codex
+worklog --source cal
 
 # Custom history file locations
 worklog --zsh-history /path/to/.zsh_history
 worklog --claude-dir /path/to/.claude
+worklog --codex-dir /path/to/.codex
+worklog --calendar-cache /path/to/calendar.json
 ```
 
 ## How it works
 
 1. Reads timestamps from your zsh history file (`: TIMESTAMP:0;command` format)
 2. Reads timestamps from Claude Code's `history.jsonl` (one JSON object per prompt)
-3. Merges and sorts all timestamps chronologically
-4. Groups into "sessions" — a session ends when there's a gap longer than the threshold (default 30 min)
-5. Prints a day-by-day breakdown with session times, durations, event counts, and which source(s) contributed
+3. Reads user-message timestamps from every Codex rollout file under `~/.codex/sessions/`
+4. Reads meeting bounds from `~/.worklog/calendar.json` and emits periodic point events spanning each meeting (so the meeting becomes one continuous session of the right duration)
+5. Merges and sorts all timestamps chronologically
+6. Groups into "sessions" — a session ends when there's a gap longer than the threshold (default 30 min)
+7. Prints a day-by-day breakdown with session times, durations, event counts, and which source(s) contributed
 
 ## Example output
 
@@ -122,5 +164,5 @@ Session gap threshold: 30 minutes
 ## Caveats
 
 - **Lower bound on actual work time.** Time spent reading output, thinking, reviewing in a browser, writing in an editor, or in meetings is not captured.
-- **Claude session granularity.** Claude history only records when *you send a prompt*, not when Claude finishes responding. Long-running Claude operations (multi-minute agent tasks) appear as a single timestamp.
+- **Claude/Codex session granularity.** Both sources only record when *you send a prompt*, not when the agent finishes responding. Long-running agent operations (multi-minute tasks) appear as a single timestamp.
 - **zsh history only.** If you use bash or another shell alongside zsh, those commands won't be included. Pass `--zsh-history` to point at a different history file if needed.

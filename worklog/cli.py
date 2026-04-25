@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""worklog - Unified work session report from zsh history + Claude Code history."""
+"""worklog - Unified work session report from zsh + Claude Code + Codex + calendar."""
 
 import argparse
 import datetime
@@ -113,6 +113,110 @@ def read_claude_history(cutoff: int, claude_dir: Path) -> list[tuple[str, int]]:
     return events
 
 
+def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
+    """Read Codex rollout user-message timestamps >= cutoff (unix seconds).
+
+    Walks ~/.codex/sessions/YYYY/MM/DD/*.jsonl and extracts every event of
+    type "event_msg" whose payload.type is "user_message" — the direct
+    analog of Claude's per-prompt history.jsonl.
+    """
+    events = []
+    sessions_dir = codex_dir / "sessions"
+    if not sessions_dir.exists():
+        print(
+            f"Warning: Codex sessions not found at {sessions_dir}",
+            file=sys.stderr,
+        )
+        return events
+
+    for path in sessions_dir.rglob("*.jsonl"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "event_msg":
+                        continue
+                    payload = obj.get("payload") or {}
+                    if payload.get("type") != "user_message":
+                        continue
+                    ts_str = obj.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        dt = datetime.datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    ts = int(dt.timestamp())
+                    if ts >= cutoff:
+                        events.append(("codex", ts))
+        except OSError:
+            continue
+    return events
+
+
+def read_calendar_cache(
+    cutoff: int, cache_path: Path, gap: int
+) -> list[tuple[str, int]]:
+    """Read calendar events from a JSON cache and emit point events.
+
+    For each meeting whose end >= cutoff, we emit periodic point events from
+    start through end at half the session-gap cadence. This guarantees any
+    two consecutive points are closer than the gap threshold, so the
+    aggregator treats the meeting as one continuous session whose bounds
+    match the meeting's real duration — even for meetings longer than the
+    gap.
+
+    Cache format: {"events": [{"start": ISO, "end": ISO, "summary": ...}, ...]}.
+    The cache is populated out-of-band (e.g. via the Google Calendar MCP) —
+    worklog itself does not talk to a calendar service.
+    """
+    out: list[tuple[str, int]] = []
+    if not cache_path.exists():
+        return out
+    try:
+        with open(cache_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"Warning: could not read calendar cache at {cache_path}: {exc}",
+            file=sys.stderr,
+        )
+        return out
+
+    step = max(gap // 2, 60)  # half the gap, but never less than 1 minute
+    for ev in data.get("events", []):
+        start_str = ev.get("start")
+        end_str = ev.get("end")
+        if not start_str or not end_str:
+            continue
+        try:
+            start_dt = datetime.datetime.fromisoformat(start_str)
+            end_dt = datetime.datetime.fromisoformat(end_str)
+        except ValueError:
+            continue
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        if end_ts < cutoff:
+            continue
+        ts = max(start_ts, cutoff)
+        end_clamped = max(end_ts, cutoff)
+        while ts < end_clamped:
+            out.append(("cal", ts))
+            ts += step
+        out.append(("cal", end_clamped))
+    return out
+
+
 def build_sessions(events: list[tuple[str, int]], gap: int) -> list[Session]:
     """Group sorted events into sessions separated by >= gap seconds of inactivity."""
     if not events:
@@ -208,28 +312,28 @@ def print_report(sessions: list[Session], since: datetime.datetime, gap: int) ->
     print("─" * width)
     print(f"  {'Total':>10}  {format_duration(grand_total):>8}")
 
-    # Source breakdown
-    zsh_count = sum(
-        s.event_count
-        for s in sessions
-        if "zsh" in s.sources and "claude" not in s.sources
-    )
-    claude_count = sum(
-        s.event_count
-        for s in sessions
-        if "claude" in s.sources and "zsh" not in s.sources
-    )
-    both_count = sum(
-        s.event_count
-        for s in sessions
-        if "claude" in s.sources and "zsh" in s.sources
-    )
+    # Source breakdown: per-source event share + how many events landed in
+    # mixed-source sessions (i.e. you were active in more than one tool in
+    # the same session window).
+    all_sources = sorted({src for s in sessions for src in s.sources})
+    per_source: dict[str, int] = {src: 0 for src in all_sources}
+    mixed_events = 0
+    for s in sessions:
+        # event_count is total events in the session; we approximate per-source
+        # share by splitting evenly across the session's sources. The exact
+        # split isn't tracked because we collapse events into a Session as we
+        # build it, so this is a fair-ish summary rather than an exact count.
+        if len(s.sources) > 1:
+            mixed_events += s.event_count
+        share = s.event_count // max(len(s.sources), 1)
+        remainder = s.event_count - share * len(s.sources)
+        for i, src in enumerate(sorted(s.sources)):
+            per_source[src] += share + (1 if i < remainder else 0)
+
     total_events = sum(s.event_count for s in sessions)
+    parts = ", ".join(f"{per_source[src]} {src}" for src in all_sources)
     print()
-    print(
-        f"  {total_events} events"
-        f" ({zsh_count} zsh-only, {claude_count} claude-only, {both_count} mixed)"
-    )
+    print(f"  {total_events} events ({parts}; {mixed_events} in mixed sessions)")
 
 
 def main() -> None:
@@ -263,10 +367,26 @@ def main() -> None:
         help="Path to Claude Code config directory. Default: ~/.claude",
     )
     parser.add_argument(
+        "--codex-dir",
+        default=None,
+        help="Path to Codex config directory. Default: ~/.codex",
+    )
+    parser.add_argument(
+        "--calendar-cache",
+        default=None,
+        help="Path to calendar JSON cache. Default: ~/.worklog/calendar.json",
+    )
+    parser.add_argument(
         "--source",
-        choices=["all", "zsh", "claude"],
+        choices=["all", "zsh", "claude", "codex", "cal"],
         default="all",
         help="Which sources to include. Default: all",
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=int,
+        default=0,
+        help="Hide sessions shorter than this many minutes. Default: 0 (show all)",
     )
 
     args = parser.parse_args()
@@ -279,6 +399,10 @@ def main() -> None:
         args.zsh_history or os.environ.get("HISTFILE", str(Path.home() / ".zsh_history"))
     )
     claude_dir = Path(args.claude_dir or (Path.home() / ".claude"))
+    codex_dir = Path(args.codex_dir or (Path.home() / ".codex"))
+    calendar_cache = Path(
+        args.calendar_cache or (Path.home() / ".worklog" / "calendar.json")
+    )
 
     # Collect events
     events: list[tuple[str, int]] = []
@@ -286,10 +410,17 @@ def main() -> None:
         events.extend(read_zsh_history(cutoff, histfile))
     if args.source in ("all", "claude"):
         events.extend(read_claude_history(cutoff, claude_dir))
+    if args.source in ("all", "codex"):
+        events.extend(read_codex_history(cutoff, codex_dir))
+    if args.source in ("all", "cal"):
+        events.extend(read_calendar_cache(cutoff, calendar_cache, gap_seconds))
 
     events.sort(key=lambda x: x[1])
 
     sessions = build_sessions(events, gap_seconds)
+    if args.min_duration > 0:
+        min_secs = args.min_duration * 60
+        sessions = [s for s in sessions if (s.end - s.start) >= min_secs]
     print_report(sessions, since_dt, gap_seconds)
 
 
