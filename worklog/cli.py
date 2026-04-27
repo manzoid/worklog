@@ -91,43 +91,69 @@ def read_zsh_history(cutoff: int, histfile: Path) -> list[tuple[str, int]]:
 
 
 def read_claude_history(cutoff: int, claude_dir: Path) -> list[tuple[str, int]]:
-    """Read Claude Code history.jsonl timestamps >= cutoff (unix seconds)."""
-    events = []
-    histfile = claude_dir / "history.jsonl"
-    cutoff_ms = cutoff * 1000
-    try:
-        with open(histfile) as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts_ms = obj.get("timestamp", 0)
-                if ts_ms >= cutoff_ms:
-                    events.append(("claude", ts_ms // 1000))
-    except FileNotFoundError:
+    """Read Claude Code per-session transcript timestamps >= cutoff.
+
+    Walks ~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl and pulls
+    every event that carries a top-level "timestamp" — user, assistant,
+    tool_use, tool_result, system, etc. This captures agent run-time
+    (multi-minute tool calls and reasoning), not just the moment you sent
+    a prompt, so a long agent task is correctly counted as active work.
+    """
+    out: list[tuple[str, int]] = []
+    projects_dir = claude_dir / "projects"
+    if not projects_dir.exists():
         print(
-            f"Warning: Claude history not found at {histfile}",
+            f"Warning: Claude transcripts not found at {projects_dir}",
             file=sys.stderr,
         )
-    return events
+        return out
+
+    for path in projects_dir.rglob("*.jsonl"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_str = obj.get("timestamp")
+                    if not ts_str or not isinstance(ts_str, str):
+                        continue
+                    try:
+                        dt = datetime.datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    ts = int(dt.timestamp())
+                    if ts >= cutoff:
+                        out.append(("claude", ts))
+        except OSError:
+            continue
+    return out
 
 
 def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
-    """Read Codex rollout user-message timestamps >= cutoff (unix seconds).
+    """Read Codex rollout event timestamps >= cutoff (unix seconds).
 
-    Walks ~/.codex/sessions/YYYY/MM/DD/*.jsonl and extracts every event of
-    type "event_msg" whose payload.type is "user_message" — the direct
-    analog of Claude's per-prompt history.jsonl.
+    Walks ~/.codex/sessions/YYYY/MM/DD/*.jsonl and pulls every event with
+    a top-level "timestamp" — user_message, agent_message, tool calls,
+    reasoning, etc. This captures full agent run-time, not just the moment
+    you sent a prompt.
     """
-    events = []
+    out: list[tuple[str, int]] = []
     sessions_dir = codex_dir / "sessions"
     if not sessions_dir.exists():
         print(
             f"Warning: Codex sessions not found at {sessions_dir}",
             file=sys.stderr,
         )
-        return events
+        return out
 
     for path in sessions_dir.rglob("*.jsonl"):
         try:
@@ -142,13 +168,8 @@ def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if obj.get("type") != "event_msg":
-                        continue
-                    payload = obj.get("payload") or {}
-                    if payload.get("type") != "user_message":
-                        continue
                     ts_str = obj.get("timestamp")
-                    if not ts_str:
+                    if not ts_str or not isinstance(ts_str, str):
                         continue
                     try:
                         dt = datetime.datetime.fromisoformat(
@@ -158,10 +179,10 @@ def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
                         continue
                     ts = int(dt.timestamp())
                     if ts >= cutoff:
-                        events.append(("codex", ts))
+                        out.append(("codex", ts))
         except OSError:
             continue
-    return events
+    return out
 
 
 def read_calendar_cache(
@@ -217,29 +238,79 @@ def read_calendar_cache(
     return out
 
 
-def build_sessions(events: list[tuple[str, int]], gap: int) -> list[Session]:
-    """Group sorted events into sessions separated by >= gap seconds of inactivity."""
-    if not events:
+@dataclass
+class Span:
+    """A contiguous run of events from a single source within that source's
+    own intra-gap. Used as the input to inter-source merging."""
+
+    source: str
+    start: int
+    end: int
+    event_count: int
+
+
+def build_source_spans(
+    events: list[tuple[str, int]], intra_gaps: dict[str, int]
+) -> list[Span]:
+    """Pass 1: build per-source spans.
+
+    Each source's events are clustered using that source's own intra-gap.
+    A 30-min silence in Claude's transcript (no tool calls firing) ends the
+    Claude span even if zsh activity is happening — silence inside one tool
+    is a real signal that you walked away from it.
+    """
+    by_source: dict[str, list[int]] = {}
+    for source, ts in events:
+        by_source.setdefault(source, []).append(ts)
+
+    default_gap = intra_gaps.get("__default__", 15 * 60)
+    spans: list[Span] = []
+    for source, ts_list in by_source.items():
+        ts_list.sort()
+        gap = intra_gaps.get(source, default_gap)
+        cur = Span(source=source, start=ts_list[0], end=ts_list[0], event_count=1)
+        for ts in ts_list[1:]:
+            if ts - cur.end > gap:
+                spans.append(cur)
+                cur = Span(source=source, start=ts, end=ts, event_count=1)
+            else:
+                cur.end = ts
+                cur.event_count += 1
+        spans.append(cur)
+    return spans
+
+
+def merge_spans(spans: list[Span], inter_gap: int) -> list[Session]:
+    """Pass 2: merge spans across sources using the inter-source gap.
+
+    Two spans (possibly from different sources) belong to the same session
+    if the silence between them is <= inter_gap. This captures "I switched
+    from Claude to a quick zsh check and back" as one continuous session.
+    """
+    if not spans:
         return []
-
-    sessions = []
-    sess = Session(
-        start=events[0][1],
-        end=events[0][1],
-        sources={events[0][0]},
-        event_count=1,
+    spans = sorted(spans, key=lambda s: s.start)
+    sessions: list[Session] = []
+    cur = Session(
+        start=spans[0].start,
+        end=spans[0].end,
+        sources={spans[0].source},
+        event_count=spans[0].event_count,
     )
-
-    for source, ts in events[1:]:
-        if ts - sess.end > gap:
-            sessions.append(sess)
-            sess = Session(start=ts, end=ts, sources={source}, event_count=1)
+    for span in spans[1:]:
+        if span.start - cur.end > inter_gap:
+            sessions.append(cur)
+            cur = Session(
+                start=span.start,
+                end=span.end,
+                sources={span.source},
+                event_count=span.event_count,
+            )
         else:
-            sess.end = ts
-            sess.sources.add(source)
-            sess.event_count += 1
-
-    sessions.append(sess)
+            cur.end = max(cur.end, span.end)
+            cur.sources.add(span.source)
+            cur.event_count += span.event_count
+    sessions.append(cur)
     return sessions
 
 
@@ -353,8 +424,30 @@ def main() -> None:
     parser.add_argument(
         "--gap",
         type=int,
-        default=30,
-        help="Minutes of inactivity that define a session boundary. Default: 30",
+        default=15,
+        help=(
+            "Inter-source gap in minutes. Two activity spans from different tools "
+            "merge into the same session if the silence between them is within this. "
+            "Default: 15"
+        ),
+    )
+    parser.add_argument(
+        "--gap-zsh",
+        type=int,
+        default=15,
+        help="Intra-source gap for zsh in minutes (sparse interactive shell). Default: 15",
+    )
+    parser.add_argument(
+        "--gap-claude",
+        type=int,
+        default=2,
+        help="Intra-source gap for Claude in minutes (dense transcript). Default: 2",
+    )
+    parser.add_argument(
+        "--gap-codex",
+        type=int,
+        default=2,
+        help="Intra-source gap for Codex in minutes (dense transcript). Default: 2",
     )
     parser.add_argument(
         "--zsh-history",
@@ -393,7 +486,17 @@ def main() -> None:
 
     since_dt = parse_since(args.since)
     cutoff = int(since_dt.timestamp())
-    gap_seconds = args.gap * 60
+    inter_gap = args.gap * 60
+    intra_gaps = {
+        "zsh": args.gap_zsh * 60,
+        "claude": args.gap_claude * 60,
+        "codex": args.gap_codex * 60,
+        # Calendar events are emitted as periodic points spanning each meeting,
+        # so any reasonable gap > the emission step (= inter_gap / 2) keeps the
+        # meeting as one continuous span.
+        "cal": inter_gap,
+        "__default__": inter_gap,
+    }
 
     histfile = Path(
         args.zsh_history or os.environ.get("HISTFILE", str(Path.home() / ".zsh_history"))
@@ -413,15 +516,14 @@ def main() -> None:
     if args.source in ("all", "codex"):
         events.extend(read_codex_history(cutoff, codex_dir))
     if args.source in ("all", "cal"):
-        events.extend(read_calendar_cache(cutoff, calendar_cache, gap_seconds))
+        events.extend(read_calendar_cache(cutoff, calendar_cache, inter_gap))
 
-    events.sort(key=lambda x: x[1])
-
-    sessions = build_sessions(events, gap_seconds)
+    spans = build_source_spans(events, intra_gaps)
+    sessions = merge_spans(spans, inter_gap)
     if args.min_duration > 0:
         min_secs = args.min_duration * 60
         sessions = [s for s in sessions if (s.end - s.start) >= min_secs]
-    print_report(sessions, since_dt, gap_seconds)
+    print_report(sessions, since_dt, inter_gap)
 
 
 if __name__ == "__main__":

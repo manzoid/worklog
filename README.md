@@ -38,11 +38,11 @@ fc -li -1
 
 ### 2. Claude Code history
 
-Claude Code automatically writes `~/.claude/history.jsonl` with millisecond timestamps for every prompt you send. No setup needed — if you use Claude Code, you already have this file.
+Claude Code writes per-session transcripts under `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl`. worklog reads every event with a top-level `timestamp` — user prompts, assistant replies, tool calls, system events. This captures the full duration the agent was running, not just the moment you sent a prompt, so a 20-minute tool-call counts as 20 minutes of work. No setup needed.
 
 ### 3. Codex history
 
-Codex automatically writes per-session rollout files under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`. worklog extracts every `event_msg` with `payload.type == "user_message"` — the analog of Claude's per-prompt history. No setup needed.
+Codex writes per-session rollout files under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`. worklog reads every event with a top-level `timestamp` — same logic as Claude. No setup needed.
 
 ### 4. Calendar meetings (optional)
 
@@ -91,7 +91,7 @@ pip install -e .
 ## Usage
 
 ```bash
-# Default: this week (since Monday midnight), 30-min session gap
+# Default: this week (since Monday midnight), 15-min inter-source gap
 worklog
 
 # Since a specific day
@@ -103,9 +103,10 @@ worklog --since today
 worklog --since 2026-03-01
 worklog --since 2026-03-01T09:00
 
-# Adjust session gap threshold (minutes of inactivity = new session)
-worklog --gap 15    # 15-minute gaps
-worklog --gap 60    # 1-hour gaps
+# Adjust the inter-source gap (how long between any two activity spans
+# before they become separate sessions). The main knob for invoicing.
+worklog --gap 10    # stricter
+worklog --gap 30    # more generous
 
 # Show only one source
 worklog --source zsh
@@ -123,12 +124,13 @@ worklog --calendar-cache /path/to/calendar.json
 ## How it works
 
 1. Reads timestamps from your zsh history file (`: TIMESTAMP:0;command` format)
-2. Reads timestamps from Claude Code's `history.jsonl` (one JSON object per prompt)
-3. Reads user-message timestamps from every Codex rollout file under `~/.codex/sessions/`
+2. Reads every timestamped event from Claude Code's per-session transcripts under `~/.claude/projects/`
+3. Reads every timestamped event from Codex rollout files under `~/.codex/sessions/`
 4. Reads meeting bounds from `~/.worklog/calendar.json` and emits periodic point events spanning each meeting (so the meeting becomes one continuous session of the right duration)
-5. Merges and sorts all timestamps chronologically
-6. Groups into "sessions" — a session ends when there's a gap longer than the threshold (default 30 min)
-7. Prints a day-by-day breakdown with session times, durations, event counts, and which source(s) contributed
+5. Merges all timestamps and runs a two-pass session algorithm:
+   - **Pass 1 (intra-source):** each source's events are clustered using that source's own gap — 2 min for Claude/Codex (dense transcripts), 15 min for zsh (sparse shell). Silence within a tool that exceeds its gap ends that tool's span, even if another tool is active.
+   - **Pass 2 (inter-source):** spans from any source are merged into sessions if the gap between them is within `--gap` (default 15 min). Captures natural tool-switching without inflating idle time.
+6. Prints a day-by-day breakdown with session times, durations, event counts, and which source(s) contributed
 
 ## Example output
 
@@ -164,5 +166,5 @@ Session gap threshold: 30 minutes
 ## Caveats
 
 - **Lower bound on actual work time.** Time spent reading output, thinking, reviewing in a browser, writing in an editor, or in meetings is not captured.
-- **Claude/Codex session granularity.** Both sources only record when *you send a prompt*, not when the agent finishes responding. Long-running agent operations (multi-minute tasks) appear as a single timestamp.
+- **Claude/Codex granularity.** worklog reads every timestamped event in agent transcripts (tool calls, assistant messages, etc.), so long agent runs are correctly counted as work time. If you walk away mid-run, the gap between events naturally falls outside the gap threshold and the session ends — but if you're at your keyboard watching the agent work, that time counts.
 - **zsh history only.** If you use bash or another shell alongside zsh, those commands won't be included. Pass `--zsh-history` to point at a different history file if needed.
