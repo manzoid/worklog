@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """worklog - Unified work session report from zsh + Claude Code + Codex + calendar."""
 
+from __future__ import annotations
+
 import argparse
 import datetime
 import json
@@ -18,8 +20,8 @@ class Session:
     event_count: int = 0
 
 
-def parse_since(value: str) -> datetime.datetime:
-    """Parse a --since value into a datetime.
+def parse_when(value: str, field: str) -> datetime.datetime:
+    """Parse a --since / --until value into a datetime.
 
     Accepts:
       - "monday", "tuesday", ... (most recent past occurrence, midnight)
@@ -62,7 +64,7 @@ def parse_since(value: str) -> datetime.datetime:
         except ValueError:
             continue
 
-    print(f"Error: cannot parse --since value: {value!r}", file=sys.stderr)
+    print(f"Error: cannot parse {field} value: {value!r}", file=sys.stderr)
     print(
         "  Accepted: monday..sunday, today, yesterday, YYYY-MM-DD, YYYY-MM-DDTHH:MM",
         file=sys.stderr,
@@ -70,8 +72,13 @@ def parse_since(value: str) -> datetime.datetime:
     sys.exit(1)
 
 
-def read_zsh_history(cutoff: int, histfile: Path) -> list[tuple[str, int]]:
-    """Read zsh extended-history timestamps >= cutoff (unix seconds)."""
+def read_zsh_history(
+    cutoff: int, histfile: Path, until: int | None = None
+) -> list[tuple[str, int]]:
+    """Read zsh extended-history timestamps in [cutoff, until) (unix seconds).
+
+    `until` is exclusive; None means no upper bound.
+    """
     events = []
     try:
         with open(histfile, "r", errors="replace") as f:
@@ -81,7 +88,7 @@ def read_zsh_history(cutoff: int, histfile: Path) -> list[tuple[str, int]]:
                     if len(parts) >= 3:
                         try:
                             ts = int(parts[1].strip())
-                            if ts >= cutoff:
+                            if ts >= cutoff and (until is None or ts < until):
                                 events.append(("zsh", ts))
                         except ValueError:
                             pass
@@ -90,14 +97,18 @@ def read_zsh_history(cutoff: int, histfile: Path) -> list[tuple[str, int]]:
     return events
 
 
-def read_claude_history(cutoff: int, claude_dir: Path) -> list[tuple[str, int]]:
-    """Read Claude Code per-session transcript timestamps >= cutoff.
+def read_claude_history(
+    cutoff: int, claude_dir: Path, until: int | None = None
+) -> list[tuple[str, int]]:
+    """Read Claude Code per-session transcript timestamps in [cutoff, until).
 
     Walks ~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl and pulls
     every event that carries a top-level "timestamp" — user, assistant,
     tool_use, tool_result, system, etc. This captures agent run-time
     (multi-minute tool calls and reasoning), not just the moment you sent
     a prompt, so a long agent task is correctly counted as active work.
+
+    `until` is exclusive; None means no upper bound.
     """
     out: list[tuple[str, int]] = []
     projects_dir = claude_dir / "projects"
@@ -131,20 +142,24 @@ def read_claude_history(cutoff: int, claude_dir: Path) -> list[tuple[str, int]]:
                     except ValueError:
                         continue
                     ts = int(dt.timestamp())
-                    if ts >= cutoff:
+                    if ts >= cutoff and (until is None or ts < until):
                         out.append(("claude", ts))
         except OSError:
             continue
     return out
 
 
-def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
-    """Read Codex rollout event timestamps >= cutoff (unix seconds).
+def read_codex_history(
+    cutoff: int, codex_dir: Path, until: int | None = None
+) -> list[tuple[str, int]]:
+    """Read Codex rollout event timestamps in [cutoff, until) (unix seconds).
 
     Walks ~/.codex/sessions/YYYY/MM/DD/*.jsonl and pulls every event with
     a top-level "timestamp" — user_message, agent_message, tool calls,
     reasoning, etc. This captures full agent run-time, not just the moment
     you sent a prompt.
+
+    `until` is exclusive; None means no upper bound.
     """
     out: list[tuple[str, int]] = []
     sessions_dir = codex_dir / "sessions"
@@ -178,7 +193,7 @@ def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
                     except ValueError:
                         continue
                     ts = int(dt.timestamp())
-                    if ts >= cutoff:
+                    if ts >= cutoff and (until is None or ts < until):
                         out.append(("codex", ts))
         except OSError:
             continue
@@ -186,20 +201,23 @@ def read_codex_history(cutoff: int, codex_dir: Path) -> list[tuple[str, int]]:
 
 
 def read_calendar_cache(
-    cutoff: int, cache_path: Path, gap: int
+    cutoff: int, cache_path: Path, gap: int, until: int | None = None
 ) -> list[tuple[str, int]]:
     """Read calendar events from a JSON cache and emit point events.
 
-    For each meeting whose end >= cutoff, we emit periodic point events from
-    start through end at half the session-gap cadence. This guarantees any
-    two consecutive points are closer than the gap threshold, so the
-    aggregator treats the meeting as one continuous session whose bounds
-    match the meeting's real duration — even for meetings longer than the
-    gap.
+    For each meeting whose end >= cutoff (and start < until, if set), we emit
+    periodic point events from start through end at half the session-gap
+    cadence. This guarantees any two consecutive points are closer than the
+    gap threshold, so the aggregator treats the meeting as one continuous
+    session whose bounds match the meeting's real duration — even for
+    meetings longer than the gap.
 
     Cache format: {"events": [{"start": ISO, "end": ISO, "summary": ...}, ...]}.
     The cache is populated out-of-band (e.g. via the Google Calendar MCP) —
     worklog itself does not talk to a calendar service.
+
+    `until` is exclusive; None means no upper bound. Meetings overlapping the
+    upper bound are clamped at it.
     """
     out: list[tuple[str, int]] = []
     if not cache_path.exists():
@@ -229,8 +247,12 @@ def read_calendar_cache(
         end_ts = int(end_dt.timestamp())
         if end_ts < cutoff:
             continue
+        if until is not None and start_ts >= until:
+            continue
         ts = max(start_ts, cutoff)
         end_clamped = max(end_ts, cutoff)
+        if until is not None:
+            end_clamped = min(end_clamped, until)
         while ts < end_clamped:
             out.append(("cal", ts))
             ts += step
@@ -321,15 +343,26 @@ def format_duration(seconds: int) -> str:
     return f"{h}h {m:02d}m"
 
 
-def print_report(sessions: list[Session], since: datetime.datetime, gap: int) -> None:
-    """Print the formatted work session report."""
+def print_report(
+    sessions: list[Session],
+    since: datetime.datetime,
+    gap: int,
+    until: datetime.datetime | None = None,
+) -> None:
+    """Print the formatted work session report.
+
+    `until` is the exclusive upper bound. If None, the window runs to "now".
+    """
     if not sessions:
-        print(f"No activity found since {since:%Y-%m-%d %H:%M}.")
+        bound = until if until is not None else datetime.datetime.now()
+        print(
+            f"No activity found between {since:%Y-%m-%d %H:%M} and {bound:%Y-%m-%d %H:%M}."
+        )
         return
 
     # Header
-    now = datetime.datetime.now()
-    print(f"Work sessions: {since:%a %b %d %H:%M} → {now:%a %b %d %H:%M}")
+    upper = until if until is not None else datetime.datetime.now()
+    print(f"Work sessions: {since:%a %b %d %H:%M} → {upper:%a %b %d %H:%M}")
     print(f"Session gap threshold: {gap // 60} minutes")
     print()
 
@@ -339,9 +372,10 @@ def print_report(sessions: list[Session], since: datetime.datetime, gap: int) ->
         day_key = datetime.datetime.fromtimestamp(sess.start).strftime("%a %b %d")
         days.setdefault(day_key, []).append(sess)
 
-    # Walk all days in range (including empty ones)
+    # Walk all days in range (including empty ones). With an exclusive
+    # `until`, end_date is the day containing the last in-range instant.
     day_cursor = since.date()
-    end_date = now.date()
+    end_date = (upper - datetime.timedelta(seconds=1)).date()
     grand_total = 0
     day_summaries: list[tuple[str, int]] = []
 
@@ -422,6 +456,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--until",
+        default=None,
+        help=(
+            "Exclusive end of reporting window (same formats as --since). "
+            "A bare YYYY-MM-DD is interpreted as midnight that day, so "
+            "`--since 2026-05-01 --until 2026-06-01` covers all of May. "
+            "Default: now."
+        ),
+    )
+    parser.add_argument(
         "--gap",
         type=int,
         default=15,
@@ -484,8 +528,20 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    since_dt = parse_since(args.since)
+    since_dt = parse_when(args.since, "--since")
     cutoff = int(since_dt.timestamp())
+    until_dt: datetime.datetime | None = None
+    until_cutoff: int | None = None
+    if args.until is not None:
+        until_dt = parse_when(args.until, "--until")
+        if until_dt <= since_dt:
+            print(
+                f"Error: --until ({until_dt:%Y-%m-%d %H:%M}) must be after "
+                f"--since ({since_dt:%Y-%m-%d %H:%M}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        until_cutoff = int(until_dt.timestamp())
     inter_gap = args.gap * 60
     intra_gaps = {
         "zsh": args.gap_zsh * 60,
@@ -510,20 +566,22 @@ def main() -> None:
     # Collect events
     events: list[tuple[str, int]] = []
     if args.source in ("all", "zsh"):
-        events.extend(read_zsh_history(cutoff, histfile))
+        events.extend(read_zsh_history(cutoff, histfile, until_cutoff))
     if args.source in ("all", "claude"):
-        events.extend(read_claude_history(cutoff, claude_dir))
+        events.extend(read_claude_history(cutoff, claude_dir, until_cutoff))
     if args.source in ("all", "codex"):
-        events.extend(read_codex_history(cutoff, codex_dir))
+        events.extend(read_codex_history(cutoff, codex_dir, until_cutoff))
     if args.source in ("all", "cal"):
-        events.extend(read_calendar_cache(cutoff, calendar_cache, inter_gap))
+        events.extend(
+            read_calendar_cache(cutoff, calendar_cache, inter_gap, until_cutoff)
+        )
 
     spans = build_source_spans(events, intra_gaps)
     sessions = merge_spans(spans, inter_gap)
     if args.min_duration > 0:
         min_secs = args.min_duration * 60
         sessions = [s for s in sessions if (s.end - s.start) >= min_secs]
-    print_report(sessions, since_dt, inter_gap)
+    print_report(sessions, since_dt, inter_gap, until_dt)
 
 
 if __name__ == "__main__":

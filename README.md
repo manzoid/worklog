@@ -103,6 +103,11 @@ worklog --since today
 worklog --since 2026-03-01
 worklog --since 2026-03-01T09:00
 
+# Bounded windows with --until (exclusive). A bare date means midnight that
+# day, so this is the idiom for "all of May":
+worklog --since 2026-05-01 --until 2026-06-01
+worklog --since 2026-03-01T09:00 --until 2026-03-01T17:00
+
 # Adjust the inter-source gap (how long between any two activity spans
 # before they become separate sessions). The main knob for invoicing.
 worklog --gap 10    # stricter
